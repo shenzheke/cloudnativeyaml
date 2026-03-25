@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: resourcefit-ok
+  namespace: sched-lab
+spec:
+  containers:
+    - name: pause
+      image: registry.k8s.io/pause:3.9
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "500m"
+          memory: "256Mi"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: resourcefit-too-large
+  namespace: sched-lab
+spec:
+  containers:
+    - name: impossible
+      image: registry.k8s.io/pause:3.9
+      resources:
+        requests:
+          cpu: "64"
+          memory: "256Gi"

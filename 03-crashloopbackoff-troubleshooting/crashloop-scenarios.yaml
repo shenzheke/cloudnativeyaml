@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crash-exit-immediately
+  namespace: crash-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: crash-exit-immediately
+  template:
+    metadata:
+      labels:
+        app: crash-exit-immediately
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["/bin/sh", "-c", "echo startup failed; exit 1"]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: crash-lab
+data:
+  EXISTING_KEY: "ok"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crash-missing-config
+  namespace: crash-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: crash-missing-config
+  template:
+    metadata:
+      labels:
+        app: crash-missing-config
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["/bin/sh", "-c", "echo $MUST_HAVE && sleep 3600"]
+          env:
+            - name: MUST_HAVE
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: MISSING_KEY
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crash-failed-liveness
+  namespace: crash-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: crash-failed-liveness
+  template:
+    metadata:
+      labels:
+        app: crash-failed-liveness
+    spec:
+      containers:
+        - name: app
+          image: nginx:1.27
+          livenessProbe:
+            httpGet:
+              path: /healthz-not-found
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crash-oom
+  namespace: crash-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: crash-oom
+  template:
+    metadata:
+      labels:
+        app: crash-oom
+    spec:
+      containers:
+        - name: memhog
+          image: polinux/stress
+          resources:
+            requests:
+              cpu: 100m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          command: ["stress"]
+          args: ["--vm", "1", "--vm-bytes", "200M", "--vm-hang", "1"]
