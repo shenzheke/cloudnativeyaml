@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: no-toleration
+  namespace: sched-lab
+spec:
+  nodeSelector:
+    dedicated: general
+  containers:
+    - name: app
+      image: nginx:1.27
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: with-toleration
+  namespace: sched-lab
+spec:
+  nodeSelector:
+    dedicated: general
+  tolerations:
+    - key: workload
+      operator: Equal
+      value: isolated
+      effect: NoSchedule
+  containers:
+    - name: app
+      image: nginx:1.27
