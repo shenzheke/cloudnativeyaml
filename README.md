@@ -13,3 +13,5 @@
 - 按目录逐个执行，避免多个场景相互干扰。
 - 每个场景都提供 `namespace.yaml`，可独立清理。
 - 建议配合 `kubectl get events --sort-by=.lastTimestamp` 全程观察。
+
+6. `06-kafka-seckill-decoupling/`：Kafka 微服务解耦 + 秒杀削峰填谷
