@@ -1,0 +1,246 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: seckill-app-code
+  namespace: kafka-scenario
+data:
+  producer.py: |
+    import json
+    import os
+    import time
+    import uuid
+    from flask import Flask, jsonify, request
+    from kafka import KafkaProducer
+
+    TOPIC = os.getenv("KAFKA_TOPIC", "flash-sale-orders")
+    producer = KafkaProducer(
+        bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP", "kafka.kafka-scenario.svc.cluster.local:9092"),
+        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        retries=5,
+        acks="all",
+    )
+
+    app = Flask(__name__)
+
+
+    @app.get("/healthz")
+    def healthz():
+        return jsonify({"status": "ok"})
+
+
+    @app.post("/orders")
+    def create_order():
+        payload = request.get_json(force=True, silent=True) or {}
+        user_id = payload.get("user_id", "anonymous")
+        sku = payload.get("sku", "sku-iphone-15")
+        quantity = int(payload.get("quantity", 1))
+
+        event = {
+            "order_id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "sku": sku,
+            "quantity": quantity,
+            "created_at": int(time.time() * 1000),
+        }
+        future = producer.send(TOPIC, key=sku.encode("utf-8"), value=event)
+        metadata = future.get(timeout=10)
+
+        return (
+            jsonify(
+                {
+                    "message": "order accepted and queued",
+                    "order_id": event["order_id"],
+                    "topic": metadata.topic,
+                    "partition": metadata.partition,
+                    "offset": metadata.offset,
+                }
+            ),
+            202,
+        )
+
+
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=8080)
+  consumer.py: |
+    import json
+    import os
+    import time
+    from kafka import KafkaConsumer
+    import redis
+
+    BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka.kafka-scenario.svc.cluster.local:9092")
+    TOPIC = os.getenv("KAFKA_TOPIC", "flash-sale-orders")
+    GROUP = os.getenv("CONSUMER_GROUP", "seckill-worker")
+    WORKER_QPS = float(os.getenv("WORKER_QPS", "20"))
+    REDIS_HOST = os.getenv("REDIS_HOST", "redis.kafka-scenario.svc.cluster.local")
+    STOCK_KEY = os.getenv("STOCK_KEY", "stock:sku-iphone-15")
+    INIT_STOCK = int(os.getenv("INIT_STOCK", "200"))
+
+    r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
+    if not r.exists(STOCK_KEY):
+        r.set(STOCK_KEY, INIT_STOCK)
+
+    LUA_DEDUCT = """
+    local stock = tonumber(redis.call('GET', KEYS[1]) or '0')
+    local qty = tonumber(ARGV[1])
+    if stock >= qty then
+      return redis.call('DECRBY', KEYS[1], qty)
+    else
+      return -1
+    end
+    """
+
+    consumer = KafkaConsumer(
+        TOPIC,
+        bootstrap_servers=BOOTSTRAP,
+        value_deserializer=lambda x: json.loads(x.decode("utf-8")),
+        auto_offset_reset="earliest",
+        enable_auto_commit=True,
+        group_id=GROUP,
+    )
+
+    print(f"[worker] started, topic={TOPIC}, qps={WORKER_QPS}")
+    last = time.time()
+
+    for message in consumer:
+        now = time.time()
+        interval = 1.0 / WORKER_QPS
+        if now - last < interval:
+            time.sleep(interval - (now - last))
+        last = time.time()
+
+        order = message.value
+        qty = int(order.get("quantity", 1))
+        left = r.eval(LUA_DEDUCT, 1, STOCK_KEY, qty)
+
+        if int(left) >= 0:
+            status = "SUCCESS"
+            result = f"order={order['order_id']} user={order['user_id']} left_stock={left}"
+        else:
+            status = "SOLD_OUT"
+            result = f"order={order['order_id']} user={order['user_id']} sold out"
+
+        r.hset(f"order:{order['order_id']}", mapping={"status": status, "payload": json.dumps(order)})
+        print(f"[worker] {result}")
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: seckill-api
+  namespace: kafka-scenario
+spec:
+  selector:
+    app: seckill-api
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seckill-api
+  namespace: kafka-scenario
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: seckill-api
+  template:
+    metadata:
+      labels:
+        app: seckill-api
+    spec:
+      containers:
+        - name: api
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              pip install --no-cache-dir flask==3.1.0 kafka-python==2.1.5 && \
+              python /app/producer.py
+          env:
+            - name: KAFKA_BOOTSTRAP
+              value: kafka.kafka-scenario.svc.cluster.local:9092
+            - name: KAFKA_TOPIC
+              value: flash-sale-orders
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          volumeMounts:
+            - name: app-code
+              mountPath: /app
+      volumes:
+        - name: app-code
+          configMap:
+            name: seckill-app-code
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seckill-worker
+  namespace: kafka-scenario
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: seckill-worker
+  template:
+    metadata:
+      labels:
+        app: seckill-worker
+    spec:
+      containers:
+        - name: worker
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              pip install --no-cache-dir kafka-python==2.1.5 redis==5.2.1 && \
+              python /app/consumer.py
+          env:
+            - name: KAFKA_BOOTSTRAP
+              value: kafka.kafka-scenario.svc.cluster.local:9092
+            - name: KAFKA_TOPIC
+              value: flash-sale-orders
+            - name: CONSUMER_GROUP
+              value: seckill-worker
+            - name: WORKER_QPS
+              value: "25"
+            - name: REDIS_HOST
+              value: redis.kafka-scenario.svc.cluster.local
+            - name: STOCK_KEY
+              value: stock:sku-iphone-15
+            - name: INIT_STOCK
+              value: "200"
+          volumeMounts:
+            - name: app-code
+              mountPath: /app
+      volumes:
+        - name: app-code
+          configMap:
+            name: seckill-app-code
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: seckill-worker-hpa
+  namespace: kafka-scenario
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: seckill-worker
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65

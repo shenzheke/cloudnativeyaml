@@ -1,0 +1,24 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seckill-burst-load
+  namespace: kafka-scenario
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: loadgen
+          image: curlimages/curl:8.8.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              i=1
+              while [ $i -le 500 ]; do
+                curl -s -X POST http://seckill-api:8080/orders \
+                  -H 'Content-Type: application/json' \
+                  -d "{\"user_id\":\"u-$i\",\"sku\":\"sku-iphone-15\",\"quantity\":1}" >/dev/null &
+                i=$((i+1))
+              done
+              wait
+              echo "burst done"
